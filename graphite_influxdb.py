@@ -21,6 +21,8 @@ def config_to_client(config=None):
         user = cfg.get('user', 'graphite')
         passw = cfg.get('pass', 'graphite')
         db = cfg.get('db', 'graphite')
+        # TODO: May be set to '.' or removed entirely, if caching for finder is implemented
+        leafvaluedelimiter = cfg.get('leafvaluedelimiter', '._field_')
     else:
         from django.conf import settings
         host = getattr(settings, 'INFLUXDB_HOST', 'localhost')
@@ -28,21 +30,24 @@ def config_to_client(config=None):
         user = getattr(settings, 'INFLUXDB_USER', 'graphite')
         passw = getattr(settings, 'INFLUXDB_PASS', 'graphite')
         db = getattr(settings, 'INFLUXDB_DB', 'graphite')
+        # TODO: May be set to '.' or removed entirely, if caching for finder is implemented
+        leafvaluedelimiter = getattr(settings, 'INFLUXDB_LEADVALUEDELIMITER', '._field_')
 
-    return InfluxDBClient(host, port, user, passw, db)
+    return (InfluxDBClient(host, port, user, passw, db), leafvaluedelimiter)
 
 
 class InfluxdbReader(object):
-    __slots__ = ('client', 'path')
+    __slots__ = ('client', 'path', 'value')
 
-    def __init__(self, client, path):
+    def __init__(self, client, path, value):
         self.client = client
         self.path = path
+        self.value = value
 
     def fetch(self, start_time, end_time):
-        data = self.client.query("select time, value from %s where time > %ds "
+        data = self.client.query("select time, %s from %s where time > %ds "
                                  "and time < %ds order asc" % (
-                                     self.path, start_time, end_time))
+                                     self.value, self.path, start_time, end_time))
         datapoints = []
         start = 0
         end = 0
@@ -77,12 +82,19 @@ class InfluxdbReader(object):
 
 
 class InfluxdbFinder(object):
-    __slots__ = ('client',)
+    __slots__ = ('client','leafvaluedelimiter')
 
     def __init__(self, config=None):
-        self.client = config_to_client(config)
+        self.client, self.leafvaluedelimiter = config_to_client(config)
 
     def find_nodes(self, query):
+        # if it is a leaf and the query does not contain a *, return right a way
+        # TODO: Implement caching for finder!! May be based on
+        # https://github.com/vimeo/graphite-influxdb/pull/3
+        if self.leafvaluedelimiter in query.pattern and '*' not in query.pattern:
+            yield LeafNode(query.pattern, InfluxdbReader(self.client, query.pattern.rpartition(self.leafvaluedelimiter)[0], query.pattern.rpartition(self.leafvaluedelimiter)[2]))
+            return
+
         # query.pattern is basically regex, though * should become [^\.]+
         # and . \.
         # but list series doesn't support pattern matching/regex yet
@@ -93,12 +105,17 @@ class InfluxdbFinder(object):
         regex = re.compile(regex)
         series = self.client.query("list series")
 
+        hidden_columns = set(['time', 'sequence_number'])
         seen_branches = set()
         for s in series:
-            name = s['name']
-            if regex.match(name) is not None:
-                logger.debug("found leaf", name=name)
-                yield LeafNode(name, InfluxdbReader(self.client, name))
+            res = self.client.query("select * from %s limit 1" % s['name'])
+            for row in res:
+                for column in row['columns']:
+                    if column not in hidden_columns:
+                        name = s['name'] + self.leafvaluedelimiter + column
+                        if regex.match(name) is not None:
+                            logger.debug("found leaf", name=name)
+                            yield LeafNode(name, InfluxdbReader(self.client, name.rpartition(self.leafvaluedelimiter)[0], name.rpartition(self.leafvaluedelimiter)[2]))
 
             while '.' in name:
                 name = name.rsplit('.', 1)[0]
