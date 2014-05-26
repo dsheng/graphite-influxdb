@@ -48,7 +48,7 @@ class InfluxdbReader(object):
             points = data[0]['points']
             start = points[0][0]
             end = points[-1][0]
-            step = points[1][0] - start
+            step = end - points[-2][0]
             datapoints = [p[2] for p in points]
         except Exception:
             pass
@@ -79,7 +79,7 @@ class InfluxdbFinder(object):
         # self.logger = app.logger
         logging.basicConfig()
         self.logger = logging.getLogger("graphite-influxdb")
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)
 
     def find_nodes(self, query):
         # query.pattern is basically regex, though * should become [^\.]+ and . \.
@@ -89,16 +89,26 @@ class InfluxdbFinder(object):
         regex = re.compile(regex)
         series = self.client.query("list series")
         for s in series:
-            self.logger.info("matching %s" % s['name'])
+            self.logger.debug("matching %s" % s['name'])
         series = [s['name'] for s in series if regex.match(s['name']) is not None]
         seen_branches = set()
         # for leaf "a.b.c" we should yield branches "a" and "a.b"
+        lfix = query.pattern.rpartition('.')[0]
+
+
         for s in series:
             self.logger.info("leaf %s" % s)
-            yield LeafNode(s, InfluxdbReader(self.client, s, self.logger))
-            branch = s.rpartition('.')[0]
-            while branch != '' and branch not in seen_branches:
-                self.logger.info("branch %s" % branch)
-                yield BranchNode(branch)
-                seen_branches.add(branch)
-                branch = branch.rpartition('.')[0]
+            if lfix == '':
+               sons = s.partition('.')
+               if sons[2] == '':
+                  yield LeafNode(s, InfluxdbReader(self.client, s, self.logger))
+               elif sons[0] not in seen_branches:
+                  seen_branches.add(sons[0])
+                  yield BranchNode(sons[0])
+            else:
+               sons = s.replace(lfix+'.','').partition('.')
+               if sons[2] == '':
+                  yield LeafNode(s, InfluxdbReader(self.client, s, self.logger))
+               elif sons[0] not in seen_branches:
+                  seen_branches.add(sons[0])
+                  yield BranchNode(sons[0])
